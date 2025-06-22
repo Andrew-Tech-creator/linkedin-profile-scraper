@@ -1,0 +1,804 @@
+import os
+import pickle
+import time
+from io import BytesIO
+import random
+import logging
+import streamlit as st
+import pandas as pd
+from urllib.parse import urlparse  # Add this import
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+
+# Update cookie file path with more robust path handling
+COOKIE_FILE = os.path.join(os.path.dirname(__file__), "linkedin_cookies.pkl")
+
+LINKEDIN_USERNAME = ""
+LINKEDIN_PASSWORD = ""
+
+def clean_linkedin_url(url: str) -> str:
+    parsed = urlparse(url.strip() if isinstance(url, str) else "")
+    return f"https://{parsed.netloc}{parsed.path}" if "linkedin.com/in/" in parsed.netloc + parsed.path else ""
+
+
+def verify_login_safe(driver: webdriver.Chrome) -> bool:
+    """Safely verify if the current session is logged in."""
+    try:
+        current_url = driver.current_url
+        if "feed" not in current_url:
+            driver.get("https://www.linkedin.com/feed/")
+            time.sleep(3)
+            
+        # Check for login indicators
+        indicators = [
+            lambda d: "feed" in d.current_url,
+            lambda d: d.find_element(By.ID, "global-nav").is_displayed(),
+            lambda d: "checkpoint" not in d.current_url
+        ]
+        
+        return all(checker(driver) for checker in indicators)
+    except:
+        return False
+
+def manual_typing(element, text, delay=0.1):
+    """Simulate more human-like typing with variable delays."""
+    actions = ActionChains(element._parent)
+    for char in text:
+        actions.send_keys(char)
+        time.sleep(delay + random.uniform(0.05, 0.15))  # More natural variation
+    actions.perform()
+
+# --- Proxy List Parsing and Rotation ---
+def load_proxies_from_csv(csv_path):
+    """Load proxies from Proxy List 1.csv and return a list of proxy dicts."""
+    proxies = []
+    try:
+        df = pd.read_csv(csv_path)
+        for _, row in df.iterrows():
+            ip = str(row['ip']).strip().replace('"', '')
+            port = str(row['port']).strip().replace('"', '')
+            protocol = str(row['protocols']).strip().replace('"', '')
+            if ip and port and protocol:
+                proxies.append({
+                    'ip': ip,
+                    'port': port,
+                    'protocol': protocol
+                })
+    except Exception as e:
+        logging.error(f"Failed to load proxies: {e}")
+    return proxies
+
+# Load proxies at module level for reuse
+PROXY_CSV_PATH = os.path.join(os.path.dirname(__file__), 'Proxy List 1.csv')
+PROXY_LIST = load_proxies_from_csv(PROXY_CSV_PATH)
+
+def get_random_proxy():
+    """Return a random proxy string for Selenium (e.g., socks4://ip:port or http://ip:port)."""
+    if not PROXY_LIST:
+        return None
+    proxy = random.choice(PROXY_LIST)
+    proto = proxy['protocol']
+    ip = proxy['ip']
+    port = proxy['port']
+    return f"{proto}://{ip}:{port}"
+
+def test_proxy(proxy):
+    """Test if the proxy is working by attempting a simple HTTP request."""
+    import requests
+    try:
+        proxies = {
+            'http': proxy,
+            'https': proxy
+        }
+        resp = requests.get('https://www.google.com', proxies=proxies, timeout=7)
+        return resp.status_code == 200
+    except Exception as e:
+        return False
+
+def get_working_proxy(max_attempts=10):
+    """Return a working proxy string, or None if none found."""
+    attempts = 0
+    tried = set()
+    while attempts < max_attempts and len(tried) < len(PROXY_LIST):
+        proxy = random.choice(PROXY_LIST)
+        proxy_str = f"{proxy['protocol']}://{proxy['ip']}:{proxy['port']}"
+        if proxy_str in tried:
+            continue
+        tried.add(proxy_str)
+        if test_proxy(proxy_str):
+            return proxy_str
+        attempts += 1
+    return None
+
+def create_webdriver_safe(headless=False, proxy=None):  # Default to visible mode
+    """Create a new Chrome WebDriver with enhanced reliability and proxy support. Returns (driver, proxy, proxy_status)."""
+    options = Options()
+    
+    # Basic options
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--start-maximized")
+    
+    # Anti-detection options
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+    
+    # Only use headless after successful initial login
+    if headless:
+        options.add_argument("--headless=new")
+    
+    # Try to find Chrome binary
+    chrome_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe")
+    ]
+    
+    for chrome_path in chrome_paths:
+        if os.path.exists(chrome_path):
+            options.binary_location = chrome_path
+            break
+    
+    # Proxy support
+    if proxy == "":
+        # Direct connection requested
+        proxy = None
+    proxy_status = None
+    if proxy:
+        proxy_status = test_proxy(proxy)
+        if proxy_status:
+            options.add_argument(f'--proxy-server={proxy}')
+        else:
+            st.sidebar.warning(f"Proxy {proxy} is not working, using direct connection.")
+            proxy = None
+    
+    # Multiple attempts with detailed error handling
+    last_exception = None
+    for attempt in range(3):
+        try:
+            logging.info(f"Attempting to create WebDriver (attempt {attempt + 1}/3)")
+            
+            # Use ChromeDriverManager to handle driver installation
+            driver_path = ChromeDriverManager().install()
+            service = Service(driver_path)
+            
+            driver = webdriver.Chrome(service=service, options=options)
+            
+            # Test the driver
+            driver.get("https://www.google.com")
+            logging.info("WebDriver created successfully")
+            
+            # Add stealth script
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                """
+            })
+            
+            return driver, proxy, proxy_status
+            
+        except Exception as e:
+            last_exception = e
+            logging.error(f"WebDriver creation failed (attempt {attempt + 1}/3): {str(e)}")
+            
+            try:
+                if 'driver' in locals():
+                    driver.quit()
+            except:
+                pass
+                
+            time.sleep(random.uniform(2, 4))
+    
+    error_msg = f"Failed to create WebDriver after 3 attempts. Last error: {str(last_exception)}"
+    logging.error(error_msg)
+    raise RuntimeError(error_msg)
+
+def transfer_cookies(src: webdriver.Chrome, dest: webdriver.Chrome):
+    for cookie in src.get_cookies():
+        dest.add_cookie(cookie)
+
+
+def scrape_profiles(df: pd.DataFrame, driver_tuple):
+    """driver_tuple: (driver, proxy, proxy_status)"""
+    driver, proxy, proxy_status = driver_tuple
+    df_out = df.copy()
+    total = len(df_out)
+    if total == 0:
+        yield 1.0, "No profiles to scrape.", df_out
+        return
+    for idx, row in df_out.iterrows():
+        # Always define proxy_info at the start of the loop
+        proxy_info = f"Proxy: {proxy} | Status: {'✅ Working' if proxy_status else '❌ Not Working'}"
+
+        # Periodic driver refresh and re-login, with proxy rotation
+        if idx and idx % 50 == 0:
+            try:
+                driver.quit()
+            except:
+                pass
+            # Use a new random proxy for each session refresh if using proxy, else direct
+            if st.session_state.get("connection_type", "Proxy") == "Proxy":
+                driver, proxy, proxy_status = create_webdriver_safe(headless=True, proxy=None)
+            else:
+                driver, proxy, proxy_status = create_webdriver_safe(headless=True, proxy="")
+            if not login_to_linkedin(driver, LINKEDIN_USERNAME, LINKEDIN_PASSWORD):
+                raise Exception("Failed to re-login after refresh")
+            time.sleep(random.uniform(2, 4))
+            # Update proxy_info after refresh
+            proxy_info = f"Proxy: {proxy} | Status: {'✅ Working' if proxy_status else '❌ Not Working'}"
+
+        # Skip if already scraped
+        if df_out.at[idx, "New Company Name"]:
+            yield idx/total, f"Skipping {idx} | {proxy_info}", df_out
+            continue
+
+        url = clean_linkedin_url(row.get("Linkedin_profile_url", ""))
+        if not url:
+            yield idx/total, f"Invalid URL row {idx} | {proxy_info}", df_out
+            continue
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                driver.get(url)
+                time.sleep(random.uniform(3, 6))
+
+                # Wait for the profile main section to load
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, "//main"))
+                )
+
+                page_source = driver.page_source
+                soup = BeautifulSoup(page_source, "html.parser")
+
+                # New Designation (Current Job Title)
+                try:
+                    # Try robust relative XPath first
+                    try:
+                        designation_elem = driver.find_element(By.XPATH, "//section[contains(@id, 'experience')]//ul/li[1]//span[contains(@class, 't-14')]")
+                    except:
+                        # Fallback to your provided absolute XPath
+                        designation_elem = driver.find_element(By.XPATH, '//*[@id="profile-content"]/div/div[2]/div/div/main/section[5]/div[3]/ul/li/div/div[2]/div/a/div/div/div/div/span[1]')
+                    df_out.at[idx, "New Designation"] = designation_elem.text.strip()
+                except Exception as e:
+                    # Fallback to BeautifulSoup
+                    designation_bs = soup.find("span", class_="t-14")
+                    df_out.at[idx, "New Designation"] = designation_bs.get_text(strip=True) if designation_bs else ""
+
+                # New Company Name (Current Experience)
+                try:
+                    # Try robust relative XPath first
+                    try:
+                        company_elem = driver.find_element(By.XPATH, "//section[contains(@id, 'experience')]//ul/li[1]//span[contains(@class, 't-14') and contains(@class, 't-normal')]")
+                    except:
+                        # Fallback to your provided absolute XPath
+                        company_elem = driver.find_element(By.XPATH, '//*[@id="profile-content"]/div/div[2]/div/div/main/section[4]/div[3]/ul/li[1]/div/div[2]/div[1]/a/div/div/div/div/span[1]')
+                    df_out.at[idx, "New Company Name"] = company_elem.text.strip()
+                except Exception as e:
+                    # Fallback to BeautifulSoup
+                    exp_section = soup.find("section", id=lambda x: x and "experience" in x)
+                    company_bs = exp_section.find("span", class_="t-14 t-normal") if exp_section else None
+                    df_out.at[idx, "New Company Name"] = company_bs.get_text(strip=True) if company_bs else ""
+
+                # New Place of Posting (Location)
+                try:
+                    location_elem = driver.find_element(By.XPATH, "//span[contains(@class, 'text-body-small') and contains(@class, 'inline') and contains(@class, 'break-words')]")
+                    df_out.at[idx, "New Place of Posting"] = location_elem.text.strip()
+                except:
+                    # Fallback to BeautifulSoup
+                    loc_bs = soup.find("span", class_="text-body-small inline t-black--light break-words")
+                    df_out.at[idx, "New Place of Posting"] = loc_bs.get_text(strip=True) if loc_bs else ""
+
+                # New Higher Education (Most Recent Education)
+                try:
+                    # Try robust relative XPath first
+                    try:
+                        edu_elem = driver.find_element(By.XPATH, "//section[contains(@id, 'education')]//ul/li[1]//span[contains(@class, 'mr1')]/span[1]")
+                    except:
+                        # Fallback to your provided absolute XPath
+                        edu_elem = driver.find_element(By.XPATH, '//*[@id="profile-content"]/div/div[2]/div/div/main/section[4]/div[3]/ul/li[1]/div/div[2]/div[1]/a/div/div/div/div/span[1]')
+                    df_out.at[idx, "New Higher Education"] = edu_elem.text.strip()
+                except Exception as e:
+                    # Fallback to BeautifulSoup
+                    edu_bs = soup.find("span", class_="mr1")
+                    df_out.at[idx, "New Higher Education"] = edu_bs.get_text(strip=True) if edu_bs else ""
+
+                # Current Qualification (Mothe prost Recent Experience or Education Title)
+                try:
+                    # Try robust relative XPath first
+                    try:
+                        qual_elem = driver.find_element(By.XPATH, "//section[contains(@id, 'experience')]//ul/li[1]//span[contains(@class, 'mr1')]/span[1]")
+                    except:
+                        # Fallback to your provided absolute XPath
+                        qual_elem = driver.find_element(By.XPATH, '//*[@id="profile-content"]/div/div[2]/div/div/main/section[4]/div[3]/ul/li/div/div[2]/div/a/div/div/div/div/span[1]')
+                    df_out.at[idx, "Current Qualification"] = qual_elem.text.strip()
+                except Exception as e:
+                    # Fallback to BeautifulSoup
+                    qual_bs = None
+                    exp_section = soup.find("section", id=lambda x: x and "experience" in x)
+                    if exp_section:
+                        qual_bs = exp_section.find("span", class_="mr1")
+                    df_out.at[idx, "Current Qualification"] = qual_bs.get_text(strip=True) if qual_bs else ""
+
+                # Show proxy info in status
+                proxy_info = f"Proxy: {proxy} | Status: {'✅ Working' if proxy_status else '❌ Not Working'}"
+                yield (idx + 1) / total, f"Scraped row {idx+1} of {total} | {proxy_info}", df_out
+                break
+                
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error(f"Failed to scrape row {idx} after {max_retries} attempts: {str(e)}")
+                else:
+                    # Try to re-login on error
+                    try:
+                        if not verify_login_safe(driver):
+                            login_to_linkedin(driver, LINKEDIN_USERNAME, LINKEDIN_PASSWORD)
+                    except:
+                        pass
+                    time.sleep(random.uniform(5, 10))
+                    continue
+                    
+    yield 1.0, f"Done! | {proxy_info}", df_out
+
+def read_excel_safe(file) -> pd.DataFrame:
+    """Read Excel file with proper data type handling"""
+    try:
+        # Read all columns as strings initially to avoid type conversion issues
+        df = pd.read_excel(file, dtype=str)
+        # Clean the DataFrame
+        df = df.fillna("")  # Replace NaN with empty strings
+        return df
+    except Exception as e:
+        st.error(f"Error reading Excel file: {str(e)}")
+        raise
+
+# Update the login function
+def login_to_linkedin(driver: webdriver.Chrome, username: str, password: str) -> bool:
+    """Enhanced LinkedIn login with better security verification handling."""
+    try:
+        # Clear any existing data
+        driver.delete_all_cookies()
+        driver.execute_script("window.localStorage.clear();")
+        driver.execute_script("window.sessionStorage.clear();")
+        
+        # Load login page and wait for it to be fully loaded
+        driver.get("https://www.linkedin.com/login")
+        time.sleep(3)  # Wait for page load
+
+        # Ensure username field is ready and focused
+        username_elem = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.ID, "username"))
+        )
+        username_elem.clear()
+        username_elem.click()  # Ensure field is focused
+        time.sleep(1)
+        
+        # Type username character by character
+        for char in username:
+            username_elem.send_keys(char)
+            time.sleep(random.uniform(0.1, 0.3))
+        time.sleep(random.uniform(1, 2))
+
+        # Ensure password field is ready and focused
+        password_elem = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.ID, "password"))
+        )
+        password_elem.clear()
+        password_elem.click()  # Ensure field is focused
+        time.sleep(1)
+        
+        # Type password character by character
+        for char in password:
+            password_elem.send_keys(char)
+            time.sleep(random.uniform(0.1, 0.3))
+        time.sleep(random.uniform(1, 2))
+
+        # Verify entered credentials before submitting
+        entered_username = username_elem.get_attribute('value')
+        entered_password = password_elem.get_attribute('value')
+        
+        if entered_username != username or not entered_password:
+            logging.error("Credential entry verification failed")
+            return False
+
+        # Click submit with retry
+        for attempt in range(3):
+            try:
+                submit_button = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.XPATH, "//button[@type='submit']"))
+                )
+                submit_button.click()
+                break
+            except:
+                if attempt == 2:
+                    logging.error("Failed to click submit button")
+                    return False
+                time.sleep(1)
+
+        # Wait for redirect with better security check handling
+        WebDriverWait(driver, 20).until(
+            lambda d: any(x in d.current_url for x in ["feed", "checkpoint", "challenge", "verification"])
+        )
+
+        current_url = driver.current_url
+        
+        # Success case
+        if "feed" in current_url:
+            logging.info("Login successful")
+            with open(COOKIE_FILE, "wb") as f:
+                pickle.dump(driver.get_cookies(), f)
+            return True
+            
+        # Security verification needed
+        if any(x in current_url for x in ["checkpoint", "challenge", "verification"]):
+            logging.info("Security verification required")
+            return handle_security_verification(driver)
+            
+        logging.error(f"Login failed - unknown page: {current_url}")
+        return False
+
+    except Exception as e:
+        logging.error(f"Login failed: {str(e)}")
+        try:
+            screenshot_path = f"login_error_{int(time.time())}.png"
+            driver.save_screenshot(screenshot_path)
+            logging.info(f"Error screenshot saved to {screenshot_path}")
+        except:
+            pass
+        return False
+
+def load_cookies(driver: webdriver.Chrome) -> bool:
+    """Load cookies with enhanced error handling."""
+    if os.path.exists(COOKIE_FILE):
+        try:
+            # First load LinkedIn homepage
+            driver.get("https://www.linkedin.com")
+            time.sleep(2)
+            
+            # Load and apply cookies
+            with open(COOKIE_FILE, "rb") as f:
+                cookies = pickle.load(f)
+                for cookie in cookies:
+                    try:
+                        # Skip invalid cookies
+                        if not all(k in cookie for k in ["name", "value"]):
+                            continue
+                        driver.add_cookie(cookie)
+                    except Exception as e:
+                        logging.debug(f"Failed to add cookie: {e}")
+                        continue
+                        
+            # Navigate to feed and verify
+            driver.get("https://www.linkedin.com/feed/")
+            time.sleep(3)
+            
+            if verify_login_safe(driver):
+                logging.info("Cookies loaded successfully")
+                return True
+                
+            logging.warning("Cookie login failed verification")
+            return False
+            
+        except Exception as e:
+            logging.warning(f"Failed to load cookies: {e}")
+            return False
+    return False
+
+def handle_security_verification(driver: webdriver.Chrome) -> bool:
+    """Handle LinkedIn security verification with better user feedback."""
+    try:
+        st.warning("⚠️ LinkedIn Security Verification Required")
+        
+        # Show helpful instructions
+        st.markdown("""
+        ### Please follow these steps:
+        1. Look for the verification window that opened
+        2. Complete the security check in that window
+        3. **DO NOT** close the window after verification
+        4. Click 'Verify' button below once complete
+        """)
+        
+        # Create columns for buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔍 Verify", key="verify_security"):
+                # Check if verification was successful
+                current_url = driver.current_url
+                if "feed" in current_url:
+                    st.success("✅ Verification successful!")
+                    # Save cookies for future use
+                    with open(COOKIE_FILE, "wb") as f:
+                        pickle.dump(driver.get_cookies(), f)
+                    return True
+                else:
+                    st.error("❌ Verification incomplete. Please try again.")
+                    return False
+                    
+        with col2:
+            if st.button("❌ Cancel", key="cancel_security"):
+                st.warning("🛑 Login cancelled. Please try again later.")
+                return False
+                
+        # Show a progress spinner while waiting
+        with st.spinner("Waiting for verification..."):
+            # Check periodically if we're redirected to feed
+            timeout = time.time() + 300  # 5 minute timeout
+            while time.time() < timeout:
+                if "feed" in driver.current_url:
+                    st.success("✅ Verification detected!")
+                    with open(COOKIE_FILE, "wb") as f:
+                        pickle.dump(driver.get_cookies(), f)
+                    return True
+                time.sleep(2)
+                
+        st.error("⌛ Verification timeout. Please try again.")
+        return False
+        
+    except Exception as e:
+        logging.error(f"Security verification handling failed: {str(e)}")
+        st.error("❌ Error during verification. Please try again.")
+        return False
+
+# Update the main UI section
+st.set_page_config(page_title="LinkedIn Alumni Scraper")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('linkedin_scraper.log'),
+        logging.StreamHandler()
+    ]
+)
+
+st.title("LinkedIn Alumni Scraper 📊")
+
+# Initialize session state
+if "auth_status" not in st.session_state:
+    st.session_state.auth_status = "not_started"
+
+with st.sidebar:
+    st.header("Settings")
+    # Updated credentials
+    username = "andrewanthonyofficial333@gmail.com"
+    password = "Awesome#God3"
+    proxy_file = st.file_uploader("Proxy list (optional)", type=["txt"])
+    # Add connection type option
+    connection_type = st.radio(
+        "Connection type:",
+        ["Direct", "Proxy"],
+        index=1,
+        help="Choose 'Proxy' to use rotating proxies, or 'Direct' to connect without a proxy."
+    )
+    st.session_state["connection_type"] = connection_type
+
+    if st.sidebar.button("🔑 Start LinkedIn Scraping"):
+        try:
+            with st.sidebar.status("Initializing...") as status:
+                status.update(label="Starting browser...")
+                if st.session_state["connection_type"] == "Proxy":
+                    driver_tuple = create_webdriver_safe(headless=False, proxy=None)
+                else:
+                    driver_tuple = create_webdriver_safe(headless=False, proxy="")
+                driver, proxy, proxy_status = driver_tuple
+                status.update(label="Attempting login...")
+                if login_to_linkedin(driver, username, password):
+                    st.session_state.headless_driver = driver_tuple
+                    st.session_state.auth_status = "ready"
+                    st.sidebar.success("✅ Login successful!")
+                    st.rerun()
+                else:
+                    try:
+                        driver.quit()
+                    except:
+                        pass
+                    st.sidebar.error("❌ Login failed. Please try:")
+                    st.sidebar.markdown("""
+                    1. Wait 5-10 minutes before retrying
+                    2. Use a VPN or different network
+                    3. Clear your browser cookies
+                    4. Complete any security verification if prompted
+                    """)
+        except Exception as e:
+            st.sidebar.error(f"Failed to initialize: {str(e)}")
+            logging.error(f"Initialization error: {str(e)}")
+            try:
+                driver.quit()
+            except:
+                pass
+    
+    elif st.session_state.auth_status == "ready":
+        st.sidebar.success("✅ Logged in and ready!")
+        if st.sidebar.button("🔄 Restart"):
+            # Clean up session
+            if "headless_driver" in st.session_state:
+                try:
+                    st.session_state.headless_driver.quit()
+                except:
+                    pass
+                del st.session_state.headless_driver
+            st.session_state.auth_status = "not_started"
+            st.rerun()
+
+# Main UI: Only show when authenticated
+if st.session_state.auth_status == "ready":
+    excel = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx", "xls"])
+    
+    if excel:
+        st.markdown("### Scraping Controls")
+        col1, col2 = st.columns(2)
+        with col1:
+            checkpoint_interval = st.number_input(
+                "Save checkpoint every N profiles",
+                min_value=10,
+                max_value=100,
+                value=50
+            )
+        with col2:
+            run = st.button("🚀 Start Scraping", use_container_width=True)
+
+        if run:
+            try:
+                # Read Excel with safe handling
+                df = read_excel_safe(excel)
+                
+                driver_tuple = st.session_state.headless_driver
+                driver, proxy, proxy_status = driver_tuple
+                
+                # Verify login status and relogin if needed
+                if not verify_login_safe(driver):
+                    st.info("Session expired, logging in again...")
+                    if not login_to_linkedin(driver, LINKEDIN_USERNAME, LINKEDIN_PASSWORD):
+                        st.error("Failed to relogin. Please restart the scraper.")
+                        st.stop()
+                
+                progress = st.progress(0)
+                status = st.empty()
+                stats = {"processed": 0, "success": 0, "errors": 0, "skipped": 0}
+                
+                # Setup statistics display
+                stat_cols = st.columns(4)
+                
+                for pct, msg, df_partial in scrape_profiles(df, driver_tuple):
+                    progress.progress(int(pct * 100))
+                    status.text(msg)
+                    
+                    # Update statistics
+                    stats["processed"] = len(df_partial)
+                    stats["success"] = df_partial["New Company Name"].notna().sum()
+                    stats["skipped"] = sum(1 for x in df_partial["New Company Name"] if x == "")
+                    stats["errors"] = stats["processed"] - stats["success"] - stats["skipped"]
+                    
+                    # Display live statistics
+                    stat_cols[0].metric("Processed", stats["processed"])
+                    stat_cols[1].metric("Success", stats["success"])
+                    stat_cols[2].metric("Errors", stats["errors"])
+                    stat_cols[3].metric("Skipped", stats["skipped"])
+                    
+                    # Save checkpoint
+                    if stats["processed"] % checkpoint_interval == 0:
+                        checkpoint_path = f"checkpoint_{int(time.time())}.xlsx"
+                        df_partial.to_excel(checkpoint_path, index=False)
+                        st.sidebar.success(f"💾 Checkpoint saved: {checkpoint_path}")
+
+                # Final save
+                st.success("✅ Scraping completed!")
+                
+                # Prepare downloads
+                buf = BytesIO()
+                df_partial.to_excel(buf, index=False)
+                buf.seek(0)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.download_button(
+                        "📥 Download All Results",
+                        data=buf,
+                        file_name=f"linkedin_alumni_results_{int(time.time())}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                with col2:
+                    # Download only successful scrapes
+                    success_buf = BytesIO()
+                    df_partial[df_partial["New Company Name"].notna()].to_excel(success_buf, index=False)
+                    success_buf.seek(0)
+                    st.download_button(
+                        "📥 Download Successful Only",
+                        data=success_buf,
+                        file_name=f"linkedin_alumni_success_{int(time.time())}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                    
+            except Exception as e:
+                st.error(f"❌ Error: {str(e)}")
+                if "df_partial" in locals():
+                    st.warning("⚠️ Partial results available:")
+                    buf = BytesIO()
+                    df_partial.to_excel(buf, index=False)
+                    buf.seek(0)
+                    st.download_button(
+                        "📥 Download Partial Results",
+                        data=buf,
+                        file_name=f"linkedin_alumni_partial_{int(time.time())}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+else:
+    st.info("👆 Click 'Start LinkedIn Scraping' in the sidebar to begin.")
+
+if os.path.exists(COOKIE_FILE):
+    os.remove(COOKIE_FILE)
+
+def save_output_excel(df: pd.DataFrame, base_filename: str = "Output_Alumni_LinkedIn_Profile") -> str:
+    """Save scraped data to Excel with proper formatting and handling."""
+    try:
+        # Create timestamp for unique filename
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(
+            os.path.dirname(__file__), 
+            f"{base_filename}_{timestamp}.xlsx"
+        )
+
+        # Create Excel writer with xlsxwriter engine for better formatting
+        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name='LinkedIn_Data')
+
+            # Get workbook and worksheet objects
+            workbook = writer.book
+            worksheet = writer.sheets['LinkedIn_Data']
+
+            # Define header format
+            header_format = workbook.add_format({
+                'bold': True,
+                'fg_color': '#D7E4BC',
+                'border': 1,
+                'align': 'center',
+                'text_wrap': True
+            })
+            # Define data format
+            data_format = workbook.add_format({
+                'border': 1,
+                'text_wrap': True,
+                'valign': 'top'
+            })
+
+            # Set column widths and apply header format
+            for idx, col in enumerate(df.columns):
+                max_length = max(
+                    df[col].astype(str).apply(len).max(),
+                    len(str(col))
+                )
+                worksheet.set_column(idx, idx, min(max_length + 2, 50), data_format)
+                worksheet.write(0, idx, col, header_format)
+
+            # Freeze the top row
+            worksheet.freeze_panes(1, 0)
+
+        logging.info(f"Successfully saved output to: {output_path}")
+        return output_path
+
+    except Exception as e:
+        logging.error(f"Failed to save Excel output: {str(e)}")
+        raise
+
+def handle_checkpoint_save(df: pd.DataFrame, checkpoint_num: int):
+    """Handle checkpoint saves during scraping."""
+    try:
+        checkpoint_path = save_output_excel(
+            df, 
+            f"Checkpoint_{checkpoint_num}_Alumni_LinkedIn"
+        )
+        st.success(f"✅ Checkpoint {checkpoint_num} saved!")
+        
+    except Exception as e:
+        st.error(f"❌ Failed to save checkpoint: {str(e)}")
